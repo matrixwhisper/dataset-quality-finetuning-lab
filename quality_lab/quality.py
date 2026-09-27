@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from statistics import mean
 from typing import Iterable
 
-from quality_lab.dataset import SCORE_DIMENSIONS, TrainingExample
+from quality_lab.dataset import ReviewDecision, SCORE_DIMENSIONS, TrainingExample
 
 
 VAGUE_PHRASES = (
@@ -38,6 +38,7 @@ class QualityReport:
     record_count: int
     scored_count: int
     unscored_count: int
+    rejected_count: int
     score_summary: dict[str, dict[str, object]]
     issue_counts: dict[str, int]
     issues: tuple[QualityIssue, ...]
@@ -47,6 +48,7 @@ class QualityReport:
             "record_count": self.record_count,
             "scored_count": self.scored_count,
             "unscored_count": self.unscored_count,
+            "rejected_count": self.rejected_count,
             "score_summary": self.score_summary,
             "issue_counts": self.issue_counts,
             "issues": [asdict(issue) for issue in self.issues],
@@ -65,7 +67,9 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
     issues: list[QualityIssue] = []
     seen_ids: set[str] = set()
     exact_pairs: dict[tuple[str, str], str] = {}
-    responses_by_prompt: dict[str, dict[str, str]] = defaultdict(dict)
+    responses_by_prompt: dict[str, dict[str, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     scores_by_dimension: dict[str, list[int]] = {
         dimension: [] for dimension in SCORE_DIMENSIONS
     }
@@ -136,7 +140,7 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
             exact_pairs[pair] = example.example_id
 
         if prompt and response:
-            responses_by_prompt[prompt][response] = example.example_id
+            responses_by_prompt[prompt][response].append(example.example_id)
 
         if example.quality_scores is not None:
             scored_count += 1
@@ -147,13 +151,14 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
 
     for responses in responses_by_prompt.values():
         if len(responses) > 1:
-            for example_id in responses.values():
-                issues.append(QualityIssue(
-                    example_id=example_id,
-                    code="multiple_responses_same_prompt",
-                    severity="info",
-                    message="prompt has multiple responses; expected for preference/rating data",
-                ))
+            for example_ids in responses.values():
+                for example_id in example_ids:
+                    issues.append(QualityIssue(
+                        example_id=example_id,
+                        code="conflicting_responses",
+                        severity="info",
+                        message="prompt has multiple responses; expected for preference/rating data",
+                    ))
 
     score_summary: dict[str, dict[str, object]] = {}
     for dimension, scores in scores_by_dimension.items():
@@ -171,6 +176,10 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
         record_count=len(records),
         scored_count=scored_count,
         unscored_count=len(records) - scored_count,
+        rejected_count=sum(
+            example.review_decision is ReviewDecision.REJECT
+            for example in records
+        ),
         score_summary=score_summary,
         issue_counts=dict(sorted(issue_counts.items())),
         issues=tuple(issues),
@@ -181,10 +190,22 @@ def human_label_coverage(examples: Iterable[TrainingExample]) -> dict[str, objec
     """Report score coverage separately from optional categorical review labels."""
     records = list(examples)
     scored = [example for example in records if example.quality_scores is not None]
+    reviewed = [
+        example for example in records
+        if example.review_decision is not ReviewDecision.UNREVIEWED
+    ]
+    defect_label_counts = Counter(
+        label.value
+        for example in reviewed
+        for label in example.defect_labels
+    )
     return {
         "total_examples": len(records),
         "human_score_coverage": len(scored) / len(records) if records else 0.0,
         "scored_examples": len(scored),
+        "human_reviewed_examples": len(reviewed),
+        "review_fraction": len(reviewed) / len(records) if records else 0.0,
+        "human_defect_label_counts": dict(sorted(defect_label_counts.items())),
         "score_dimensions": list(SCORE_DIMENSIONS),
         "score_source": "dataset-provided human ratings; not project-invented labels",
     }
