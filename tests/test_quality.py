@@ -121,6 +121,23 @@ class QualityAuditTests(unittest.TestCase):
             {"incomplete": 1},
         )
 
+    def test_helpsteer_scores_are_summarized_without_relabeling(self) -> None:
+        from quality_lab.dataset import SCORE_DIMENSIONS
+
+        scores = {
+            dimension: 3
+            for dimension in SCORE_DIMENSIONS
+        }
+        example = make_example("rated-1", quality_scores=scores)
+        report = audit_examples([example])
+
+        self.assertEqual(report.scored_count, 1)
+        self.assertEqual(report.unscored_count, 0)
+        self.assertEqual(report.score_summary["helpfulness"]["mean"], 3)
+        self.assertEqual(
+            report.score_summary["helpfulness"]["histogram_0_to_4"]["3"],
+            1,
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

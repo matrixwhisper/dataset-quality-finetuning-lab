@@ -1,8 +1,4 @@
-"""Deterministic data-quality checks and human-review summaries.
-
-Rule-based findings are triage signals, not ground-truth defect labels.
-Semantic and model-based checks are added in later stages.
-"""
+"""Quality auditing for human-rated response datasets."""
 
 from __future__ import annotations
 
@@ -10,9 +6,10 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from statistics import mean
 from typing import Iterable
 
-from quality_lab.dataset import DefectLabel, TrainingExample
+from quality_lab.dataset import SCORE_DIMENSIONS, TrainingExample
 
 
 VAGUE_PHRASES = (
@@ -39,50 +36,42 @@ class QualityIssue:
 @dataclass(frozen=True)
 class QualityReport:
     record_count: int
-    reviewed_count: int
-    accepted_count: int
-    revised_count: int
-    rejected_count: int
-    unreviewed_count: int
-    defect_label_counts: dict[str, int]
+    scored_count: int
+    unscored_count: int
+    score_summary: dict[str, dict[str, object]]
     issue_counts: dict[str, int]
     issues: tuple[QualityIssue, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
             "record_count": self.record_count,
-            "reviewed_count": self.reviewed_count,
-            "accepted_count": self.accepted_count,
-            "revised_count": self.revised_count,
-            "rejected_count": self.rejected_count,
-            "unreviewed_count": self.unreviewed_count,
-            "defect_label_counts": self.defect_label_counts,
+            "scored_count": self.scored_count,
+            "unscored_count": self.unscored_count,
+            "score_summary": self.score_summary,
             "issue_counts": self.issue_counts,
             "issues": [asdict(issue) for issue in self.issues],
         }
 
 
 def normalize_text(value: str) -> str:
-    """Normalize Unicode and whitespace for exact-match comparisons."""
-    unicode_normalized = unicodedata.normalize("NFKC", value)
-    return " ".join(unicode_normalized.casefold().split())
+    """Normalize Unicode and whitespace for exact comparisons."""
+    normalized = unicodedata.normalize("NFKC", value)
+    return " ".join(normalized.casefold().split())
 
 
 def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
-    """Audit structure and obvious quality risks without pretending to judge truth."""
+    """Flag structural risks and summarize human ratings without relabeling them."""
     records = list(examples)
     issues: list[QualityIssue] = []
     seen_ids: set[str] = set()
     exact_pairs: dict[tuple[str, str], str] = {}
-    answers_by_instruction: dict[str, dict[str, str]] = defaultdict(dict)
-    decision_counts: Counter[str] = Counter()
-    label_counts: Counter[str] = Counter()
+    responses_by_prompt: dict[str, dict[str, str]] = defaultdict(dict)
+    scores_by_dimension: dict[str, list[int]] = {
+        dimension: [] for dimension in SCORE_DIMENSIONS
+    }
+    scored_count = 0
 
     for example in records:
-        decision_counts[example.review_decision.value] += 1
-        for label in example.defect_labels:
-            label_counts[label.value] += 1
-
         if example.example_id in seen_ids:
             issues.append(QualityIssue(
                 example_id=example.example_id,
@@ -93,9 +82,7 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
         seen_ids.add(example.example_id)
 
         if not example.license_id.strip() or example.license_id.casefold() in {
-            "unknown",
-            "unspecified",
-            "n/a",
+            "unknown", "unspecified", "n/a",
         }:
             issues.append(QualityIssue(
                 example_id=example.example_id,
@@ -104,17 +91,16 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
                 message="record needs a verifiable license identifier",
             ))
 
-        instruction = normalize_text(example.instruction)
+        prompt = normalize_text(example.instruction)
         response = normalize_text(example.response)
 
-        if len(instruction.split()) < 3:
+        if len(prompt.split()) < 3:
             issues.append(QualityIssue(
                 example_id=example.example_id,
                 code="very_short_instruction",
                 severity="warning",
                 message="instruction has fewer than three normalized words",
             ))
-
         if len(response.split()) < 3:
             issues.append(QualityIssue(
                 example_id=example.example_id,
@@ -122,15 +108,13 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
                 severity="warning",
                 message="response has fewer than three normalized words",
             ))
-
-        if any(phrase in instruction for phrase in VAGUE_PHRASES):
+        if any(phrase in prompt for phrase in VAGUE_PHRASES):
             issues.append(QualityIssue(
                 example_id=example.example_id,
                 code="possible_ambiguity",
                 severity="review",
                 message="instruction contains a phrase from the ambiguity triage list",
             ))
-
         if PLACEHOLDER_PATTERN.search(example.instruction) or PLACEHOLDER_PATTERN.search(example.response):
             issues.append(QualityIssue(
                 example_id=example.example_id,
@@ -139,8 +123,8 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
                 message="instruction or response contains a placeholder token",
             ))
 
-        pair_key = (instruction, response)
-        previous_id = exact_pairs.get(pair_key)
+        pair = (prompt, response)
+        previous_id = exact_pairs.get(pair)
         if previous_id is not None:
             issues.append(QualityIssue(
                 example_id=example.example_id,
@@ -149,57 +133,58 @@ def audit_examples(examples: Iterable[TrainingExample]) -> QualityReport:
                 message=f"normalized prompt/response pair duplicates {previous_id}",
             ))
         else:
-            exact_pairs[pair_key] = example.example_id
+            exact_pairs[pair] = example.example_id
 
-        if instruction and response:
-            answers_by_instruction[instruction][response] = example.example_id
+        if prompt and response:
+            responses_by_prompt[prompt][response] = example.example_id
 
-    for instruction, answers in answers_by_instruction.items():
-        if len(answers) > 1:
-            for example_id in answers.values():
+        if example.quality_scores is not None:
+            scored_count += 1
+            for dimension in SCORE_DIMENSIONS:
+                scores_by_dimension[dimension].append(
+                    example.quality_scores[dimension]
+                )
+
+    for responses in responses_by_prompt.values():
+        if len(responses) > 1:
+            for example_id in responses.values():
                 issues.append(QualityIssue(
                     example_id=example_id,
-                    code="conflicting_responses",
-                    severity="review",
-                    message="identical normalized instruction has multiple responses; reviewer adjudication required",
+                    code="multiple_responses_same_prompt",
+                    severity="info",
+                    message="prompt has multiple responses; expected for preference/rating data",
                 ))
 
-    issue_counts = Counter(issue.code for issue in issues)
-    reviewed = (
-        decision_counts["accept"]
-        + decision_counts["revise"]
-        + decision_counts["reject"]
-    )
+    score_summary: dict[str, dict[str, object]] = {}
+    for dimension, scores in scores_by_dimension.items():
+        histogram = Counter(scores)
+        score_summary[dimension] = {
+            "count": len(scores),
+            "mean": round(mean(scores), 4) if scores else None,
+            "histogram_0_to_4": {
+                str(score): histogram.get(score, 0) for score in range(5)
+            },
+        }
 
+    issue_counts = Counter(issue.code for issue in issues)
     return QualityReport(
         record_count=len(records),
-        reviewed_count=reviewed,
-        accepted_count=decision_counts["accept"],
-        revised_count=decision_counts["revise"],
-        rejected_count=decision_counts["reject"],
-        unreviewed_count=decision_counts["unreviewed"],
-        defect_label_counts=dict(sorted(label_counts.items())),
+        scored_count=scored_count,
+        unscored_count=len(records) - scored_count,
+        score_summary=score_summary,
         issue_counts=dict(sorted(issue_counts.items())),
         issues=tuple(issues),
     )
 
 
 def human_label_coverage(examples: Iterable[TrainingExample]) -> dict[str, object]:
-    """Summarize adjudicated examples separately from automatic audit signals."""
+    """Report score coverage separately from optional categorical review labels."""
     records = list(examples)
-    reviewed = [
-        example for example in records
-        if example.review_decision.value != "unreviewed"
-    ]
-    counts = Counter(
-        label.value
-        for example in reviewed
-        for label in example.defect_labels
-    )
+    scored = [example for example in records if example.quality_scores is not None]
     return {
         "total_examples": len(records),
-        "human_reviewed_examples": len(reviewed),
-        "review_fraction": len(reviewed) / len(records) if records else 0.0,
-        "human_defect_label_counts": dict(sorted(counts.items())),
-        "labels_are_human_adjudicated": True,
+        "human_score_coverage": len(scored) / len(records) if records else 0.0,
+        "scored_examples": len(scored),
+        "score_dimensions": list(SCORE_DIMENSIONS),
+        "score_source": "dataset-provided human ratings; not project-invented labels",
     }
