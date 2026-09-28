@@ -1,7 +1,8 @@
-"""Base-versus-QLoRA evaluation and validation-only generation search."""
+"""Base-versus-QLoRA evaluation for five human-rated quality dimensions."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -9,12 +10,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
-from quality_lab.dataset import ReviewDecision, TrainingExample
+from quality_lab.dataset import SCORE_DIMENSIONS, TrainingExample
 
 
 @dataclass(frozen=True)
 class GenerationSettings:
-    max_new_tokens: int = 128
+    max_new_tokens: int = 96
     temperature: float = 0.0
     top_p: float = 1.0
 
@@ -25,34 +26,47 @@ class GenerationSettings:
             raise ValueError("invalid temperature or top_p")
 
 
+def _fingerprint(examples: Iterable[TrainingExample]) -> str:
+    digest = hashlib.sha256()
+    for example in sorted(examples, key=lambda row: row.example_id):
+        digest.update(json.dumps(example.to_record(), sort_keys=True).encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _prompt(example: TrainingExample) -> str:
     return (
-        "Decide whether this training example contains a quality defect. "
-        "Allowed labels: ambiguous, incomplete, contradictory, duplicate, "
-        "irrelevant, incorrect, other. Return exactly one JSON object with "
-        "keys is_defective (boolean) and labels (array of allowed label strings). "
-        "Use an empty labels array for a clean example.\n\n"
-        f"Instruction:\n{example.instruction}\n\nResponse:\n{example.response}"
+        "Predict the five human ratings for this response. Return JSON only with "
+        "integer values from 0 to 4 for exactly these keys: helpfulness, correctness, "
+        "coherence, complexity, verbosity.\n\n"
+        f"Prompt:\n{example.instruction}\n\nResponse:\n{example.response}"
     )
 
 
-def _parse_prediction(text: str) -> tuple[bool, list[str], bool]:
-    match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
+def parse_ratings(text: str) -> dict[str, int] | None:
+    match = re.search(r"\{[^{}]*\}", text, flags=re.DOTALL)
     if match is None:
-        return False, [], True
+        return None
     try:
-        value = json.loads(match.group(0))
-        defective = value["is_defective"]
-        labels = value["labels"]
-        if not isinstance(defective, bool) or not isinstance(labels, list):
-            return False, [], True
-        return defective, [str(label) for label in labels], False
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return False, [], True
+        values = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(values, dict) or set(values) != set(SCORE_DIMENSIONS):
+        return None
+
+    parsed: dict[str, int] = {}
+    for dimension in SCORE_DIMENSIONS:
+        value = values[dimension]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not 0 <= value <= 4:
+            return None
+        parsed[dimension] = max(0, min(4, int(round(value))))
+    return parsed
 
 
 class QualityJudge:
-    """Shared Transformers generation wrapper for base and adapter evaluation."""
+    """Shared 4-bit inference wrapper for base model and saved adapter."""
 
     def __init__(
         self,
@@ -62,37 +76,37 @@ class QualityJudge:
     ) -> None:
         try:
             import torch
+            from peft import PeftModel
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         except ImportError as exc:
-            raise RuntimeError("install Transformers, PyTorch, and bitsandbytes") from exc
+            raise RuntimeError("install CUDA-compatible Transformers, PEFT, and bitsandbytes") from exc
         if not torch.cuda.is_available():
-            raise RuntimeError("LLM inference requires a CUDA GPU in this experiment")
+            raise RuntimeError("quality judge inference requires CUDA")
 
         self.torch = torch
         self.model_id = model_id
         self.adapter_path = adapter_path
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+        tokenizer_path = str(adapter_path) if adapter_path else model_id
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, revision=revision)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        quantization = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=dtype,
-        )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             revision=revision,
-            quantization_config=quantization,
-            device_map="auto",
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=dtype,
+            ),
+            device_map={"": torch.cuda.current_device()},
         )
         if adapter_path:
-            from peft import PeftModel
             self.model = PeftModel.from_pretrained(
                 self.model,
-                adapter_path,
+                str(adapter_path),
                 is_trainable=False,
             )
         self.model.eval()
@@ -109,10 +123,13 @@ class QualityJudge:
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
+            truncation=True,
+            max_length=768 - settings.max_new_tokens,
         )
         device = self.model.get_input_embeddings().weight.device
         encoded = encoded.to(device)
         input_count = int(encoded.shape[-1])
+
         kwargs: dict[str, object] = {
             "max_new_tokens": settings.max_new_tokens,
             "do_sample": settings.temperature > 0,
@@ -128,20 +145,22 @@ class QualityJudge:
         with torch.inference_mode():
             generated = self.model.generate(input_ids=encoded, **kwargs)
         torch.cuda.synchronize()
-        latency = time.perf_counter() - started
+
         text = self.tokenizer.decode(
             generated[0, input_count:],
             skip_special_tokens=True,
         )
-        defective, labels, parse_error = _parse_prediction(text)
+        prediction = parse_ratings(text)
+        expected = example.quality_scores
+        if expected is None:
+            raise ValueError(f"{example.example_id}: missing human quality scores")
         return {
             "example_id": example.example_id,
-            "expected_defective": bool(example.defect_labels),
-            "predicted_defective": defective,
-            "predicted_labels": labels,
-            "parse_error": parse_error,
-            "latency_seconds": latency,
-            "raw_output": text[:2000],
+            "expected": {key: int(expected[key]) for key in SCORE_DIMENSIONS},
+            "predicted": prediction,
+            "parse_error": prediction is None,
+            "latency_seconds": time.perf_counter() - started,
+            "raw_output": text[:1000],
         }
 
     def metadata(self) -> dict[str, object]:
@@ -163,103 +182,96 @@ def evaluate_judge(
     settings: GenerationSettings,
     split_name: str,
 ) -> dict[str, object]:
-    from sklearn.metrics import (
-        accuracy_score,
-        balanced_accuracy_score,
-        confusion_matrix,
-        f1_score,
-        precision_score,
-        recall_score,
-    )
-
-    if split_name not in {"validation", "test"}:
-        raise ValueError("LLM benchmark evaluation must name validation or test")
-    records = list(examples)
+    if split_name not in {"tuning", "test"}:
+        raise ValueError("split_name must be tuning or test")
+    records = tuple(examples)
     if not records:
         raise ValueError(f"{split_name} split is empty")
-    if any(item.review_decision is ReviewDecision.UNREVIEWED for item in records):
-        raise ValueError(f"{split_name} includes records without human labels")
+    if any(example.quality_scores is None for example in records):
+        raise ValueError(f"{split_name} contains rows without HelpSteer2 ratings")
 
-    rows = [judge.predict(item, settings) for item in records]
-    expected = [int(row["expected_defective"]) for row in rows]
-    predicted = [int(row["predicted_defective"]) for row in rows]
+    rows = [judge.predict(example, settings) for example in records]
+    valid = [row for row in rows if row["predicted"] is not None]
+    mae_by_dimension = {}
+
+    for dimension in SCORE_DIMENSIONS:
+        errors = [
+            abs(row["expected"][dimension] - row["predicted"][dimension])
+            for row in valid
+        ]
+        mae_by_dimension[dimension] = sum(errors) / len(errors) if errors else None
+
+    available = [value for value in mae_by_dimension.values() if value is not None]
+    exact = sum(
+        row["expected"] == row["predicted"]
+        for row in valid
+    )
+    within_one = sum(
+        all(
+            abs(row["expected"][dimension] - row["predicted"][dimension]) <= 1
+            for dimension in SCORE_DIMENSIONS
+        )
+        for row in valid
+    )
     return {
         "model_id": judge.model_id,
         "adapter_path": judge.adapter_path,
         "split": split_name,
-        "task_count": len(records),
-        "accuracy": float(accuracy_score(expected, predicted)),
-        "balanced_accuracy": float(balanced_accuracy_score(expected, predicted)),
-        "precision": float(precision_score(expected, predicted, zero_division=0)),
-        "recall": float(recall_score(expected, predicted, zero_division=0)),
-        "f1": float(f1_score(expected, predicted, zero_division=0)),
-        "confusion_matrix_labels_clean_defective": confusion_matrix(
-            expected, predicted, labels=[0, 1]
-        ).tolist(),
-        "parse_error_count": sum(bool(row["parse_error"]) for row in rows),
-        "mean_latency_seconds": sum(float(row["latency_seconds"]) for row in rows) / len(rows),
+        "example_count": len(records),
+        "valid_json_count": len(valid),
+        "parse_error_count": len(records) - len(valid),
+        "mae_by_dimension": mae_by_dimension,
+        "macro_mae": sum(available) / len(available) if available else None,
+        "exact_vector_accuracy": exact / len(valid) if valid else None,
+        "within_one_all_dimensions": within_one / len(valid) if valid else None,
+        "mean_latency_seconds": sum(row["latency_seconds"] for row in rows) / len(rows),
         "settings": asdict(settings),
         "model_metadata": judge.metadata(),
         "per_example": rows,
     }
 
 
-def _neighbors(settings: GenerationSettings) -> list[GenerationSettings]:
-    values = [
-        replace(settings, max_new_tokens=max(32, settings.max_new_tokens - 32)),
-        replace(settings, max_new_tokens=min(256, settings.max_new_tokens + 32)),
-        replace(settings, temperature=0.0 if settings.temperature else 0.2),
-    ]
-    return list(dict.fromkeys(value for value in values if value != settings))
-
-
-def hill_climb_validation(
-    validation_examples: tuple[TrainingExample, ...],
+def search_tuning(
+    examples: tuple[TrainingExample, ...],
     judge_factory: Callable[[], QualityJudge],
-    initial_settings: GenerationSettings,
-    evaluation_budget: int,
     output_path: str | Path,
-) -> tuple[GenerationSettings, list[dict[str, object]]]:
-    """Select decoding settings using validation labels only."""
-    if not validation_examples:
-        raise ValueError("validation split is empty")
-    if evaluation_budget < 1:
-        raise ValueError("evaluation budget must be positive")
-    if any(row.review_decision is ReviewDecision.UNREVIEWED for row in validation_examples):
-        raise ValueError("validation search requires human-reviewed labels")
+    token_budgets: tuple[int, ...] = (64, 96, 128),
+) -> dict[str, object]:
+    """Choose generation length on tuning data only, minimizing macro MAE."""
+    if not examples:
+        raise ValueError("tuning split is empty")
+    if any(example.quality_scores is None for example in examples):
+        raise ValueError("tuning rows need human scores")
 
     judge = judge_factory()
-    current = initial_settings
-    history: list[dict[str, object]] = []
-    best_f1 = -1.0
-    evaluated: set[GenerationSettings] = set()
+    history = []
+    for token_budget in token_budgets:
+        metrics = evaluate_judge(
+            examples,
+            judge,
+            GenerationSettings(max_new_tokens=token_budget),
+            "tuning",
+        )
+        history.append({"max_new_tokens": token_budget, "metrics": metrics})
 
-    for step in range(evaluation_budget):
-        proposals = [current] if step == 0 else _neighbors(current)
-        candidate = next((item for item in proposals if item not in evaluated), None)
-        if candidate is None:
-            break
-        evaluated.add(candidate)
-        result = evaluate_judge(validation_examples, judge, candidate, "validation")
-        score = float(result["f1"])
-        history.append({
-            "step": step,
-            "split": "validation",
-            "settings": asdict(candidate),
-            "metrics": result,
-        })
-        if score > best_f1:
-            best_f1 = score
-            current = candidate
+    candidates = [
+        item for item in history
+        if item["metrics"]["macro_mae"] is not None
+    ]
+    if not candidates:
+        raise RuntimeError("all tuning outputs failed score parsing")
+    selected = min(candidates, key=lambda item: item["metrics"]["macro_mae"])
 
     artifact = {
-        "search_split": "validation",
+        "search_split": "tuning",
         "test_accessed": False,
-        "validation_example_ids": [row.example_id for row in validation_examples],
-        "selected_settings": asdict(current),
+        "tuning_example_ids": [example.example_id for example in examples],
+        "tuning_data_sha256": _fingerprint(examples),
+        "selected_settings": {"max_new_tokens": selected["max_new_tokens"]},
+        "selected_metrics": selected["metrics"],
         "history": history,
     }
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return current, history
+    return artifact

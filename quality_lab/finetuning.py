@@ -1,104 +1,136 @@
-"""Real QLoRA training of an LLM quality judge from human-reviewed examples."""
+"""QLoRA supervised fine-tuning against HelpSteer2's five human ratings."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
 from quality_lab.config import LabConfig
-from quality_lab.dataset import ReviewDecision, TrainingExample
+from quality_lab.dataset import SCORE_DIMENSIONS, TrainingExample
 
 
-def _training_messages(example: TrainingExample) -> tuple[dict[str, str], dict[str, str]]:
-    if example.review_decision is ReviewDecision.UNREVIEWED:
-        raise ValueError(f"{example.example_id}: cannot train from an unreviewed row")
+def _scores(example: TrainingExample) -> dict[str, int]:
+    if example.quality_scores is None:
+        raise ValueError(f"{example.example_id}: missing human quality scores")
+    return {name: int(example.quality_scores[name]) for name in SCORE_DIMENSIONS}
 
-    labels = sorted(label.value for label in example.defect_labels)
-    if example.review_decision is ReviewDecision.ACCEPT and labels:
-        raise ValueError(f"{example.example_id}: accepted example has defect labels")
-    if example.review_decision is not ReviewDecision.ACCEPT and not labels:
-        raise ValueError(f"{example.example_id}: defect decision has no defect labels")
 
-    prompt = (
-        "Review this instruction/response training example for quality defects. "
-        "Use only these labels: ambiguous, incomplete, contradictory, duplicate, "
-        "irrelevant, incorrect, other. Return JSON only with boolean is_defective "
-        "and a labels array. Do not infer defects that are not evident.\n\n"
-        f"Instruction:\n{example.instruction}\n\nResponse:\n{example.response}"
-    )
-    target = json.dumps(
-        {"is_defective": bool(labels), "labels": labels},
-        sort_keys=True,
-    )
+def _user_text(example: TrainingExample) -> str:
     return (
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": target},
+        "Predict the five human ratings for this response. Each score is an "
+        "integer from 0 to 4. Return JSON only, with exactly these keys: "
+        "helpfulness, correctness, coherence, complexity, verbosity.\n\n"
+        f"Prompt:\n{example.instruction}\n\nResponse:\n{example.response}"
     )
 
 
-def _encode_row(tokenizer, example: TrainingExample, max_length: int) -> dict[str, list[int]]:
-    user_message, assistant_message = _training_messages(example)
-    prefix = tokenizer.apply_chat_template(
-        [user_message],
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    full = tokenizer.apply_chat_template(
-        [user_message, assistant_message],
-        tokenize=True,
-        add_generation_prompt=False,
-    )
-    if full[:len(prefix)] != prefix:
-        raise ValueError(f"{example.example_id}: tokenizer chat prefix mismatch")
-    if len(prefix) >= max_length:
-        raise ValueError(f"{example.example_id}: prompt consumes the token budget")
+def _fit_user_ids(tokenizer, example: TrainingExample, token_budget: int) -> list[int]:
+    prompt_text = example.instruction
+    response_text = example.response
 
-    ids = full[:max_length]
-    labels = [-100] * min(len(prefix), len(ids))
-    labels.extend(ids[len(labels):])
+    for _ in range(40):
+        text = (
+            "Predict the five human ratings for this response. Each score is an "
+            "integer from 0 to 4. Return JSON only, with exactly these keys: "
+            "helpfulness, correctness, coherence, complexity, verbosity.\n\n"
+            f"Prompt:\n{prompt_text}\n\nResponse:\n{response_text}"
+        )
+        ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        if len(ids) <= token_budget:
+            return ids
+
+        excess = len(ids) - token_budget + 8
+        response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
+        if len(response_ids) > 16:
+            response_text = tokenizer.decode(
+                response_ids[:max(16, len(response_ids) - excess)],
+                skip_special_tokens=True,
+            )
+            continue
+
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        if len(prompt_ids) > 16:
+            prompt_text = tokenizer.decode(
+                prompt_ids[:max(16, len(prompt_ids) - excess)],
+                skip_special_tokens=True,
+            )
+            continue
+        break
+
+    raise ValueError(f"{example.example_id}: could not fit prompt into token budget")
+
+
+def _encode(tokenizer, example: TrainingExample, max_length: int) -> dict[str, list[int]]:
+    prefix = _fit_user_ids(tokenizer, example, max_length - 96)
+    target = tokenizer(
+        json.dumps(_scores(example), sort_keys=True),
+        add_special_tokens=False,
+    )["input_ids"]
+    target.append(tokenizer.eos_token_id)
+
+    room = max_length - len(prefix)
+    if room < 1:
+        raise ValueError(f"{example.example_id}: no room remains for target")
+    target = target[:room]
+    target[-1] = tokenizer.eos_token_id
+
+    ids = prefix + target
     return {
         "input_ids": ids,
         "attention_mask": [1] * len(ids),
-        "labels": labels,
+        "labels": [-100] * len(prefix) + target,
     }
 
 
-def _collate(batch: list[dict[str, Any]], pad_token_id: int) -> dict[str, Any]:
-    import torch
-
-    width = max(len(row["input_ids"]) for row in batch)
-    input_ids, attention_masks, labels = [], [], []
-    for row in batch:
-        padding = width - len(row["input_ids"])
-        input_ids.append(row["input_ids"] + [pad_token_id] * padding)
-        attention_masks.append(row["attention_mask"] + [0] * padding)
-        labels.append(row["labels"] + [-100] * padding)
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long),
-    }
-
-
-class _TokenizedRows:
+class _Rows:
     def __init__(self, rows: list[dict[str, list[int]]]) -> None:
         self.rows = rows
 
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        import torch
-        return {key: torch.tensor(value, dtype=torch.long) for key, value in self.rows[index].items()}
+    def __getitem__(self, index: int) -> dict[str, list[int]]:
+        return self.rows[index]
 
 
-def _subset_fingerprint(examples: tuple[TrainingExample, ...]) -> str:
+def _collate(batch: list[dict[str, Any]], pad_token_id: int) -> dict[str, Any]:
+    import torch
+
+    # Normalize values to Python lists before padding. This avoids the
+    # Tensor-plus-list TypeError from the earlier Kaggle attempt.
+    rows = [
+        {
+            key: value.tolist() if isinstance(value, torch.Tensor) else value
+            for key, value in row.items()
+        }
+        for row in batch
+    ]
+    width = max(len(row["input_ids"]) for row in rows)
+    ids, masks, labels = [], [], []
+    for row in rows:
+        padding = width - len(row["input_ids"])
+        ids.append(row["input_ids"] + [pad_token_id] * padding)
+        masks.append(row["attention_mask"] + [0] * padding)
+        labels.append(row["labels"] + [-100] * padding)
+    return {
+        "input_ids": torch.tensor(ids, dtype=torch.long),
+        "attention_mask": torch.tensor(masks, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+    }
+
+
+def _fingerprint(examples: tuple[TrainingExample, ...]) -> str:
     digest = hashlib.sha256()
     for example in sorted(examples, key=lambda row: row.example_id):
-        digest.update(json.dumps(example.to_record(), sort_keys=True).encode("utf-8"))
+        digest.update(json.dumps(example.to_record(), sort_keys=True).encode())
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -107,42 +139,36 @@ def train_qlora(
     config: LabConfig,
     train_examples: tuple[TrainingExample, ...],
     output_dir: str | Path,
+    max_examples: int | None = 512,
 ) -> Path:
-    """Fit and save an adapter using only the supplied training examples."""
+    """Train a real 4-bit NF4 LoRA adapter on score-labeled training examples."""
     if not train_examples:
         raise ValueError("training split is empty")
-    if len({item.example_id for item in train_examples}) != len(train_examples):
-        raise ValueError("training split contains duplicate example IDs")
-    for example in train_examples:
-        _training_messages(example)
+    if len({row.example_id for row in train_examples}) != len(train_examples):
+        raise ValueError("duplicate training example IDs")
+    for row in train_examples:
+        _scores(row)
+
+    if max_examples is not None and len(train_examples) > max_examples:
+        train_examples = tuple(
+            random.Random(config.seed).sample(list(train_examples), max_examples)
+        )
 
     try:
         import torch
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            BitsAndBytesConfig,
-            Trainer,
-            TrainingArguments,
-        )
+        from torch.utils.data import DataLoader
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     except ImportError as exc:
-        raise RuntimeError("install the ML dependencies in a CUDA-enabled environment") from exc
+        raise RuntimeError("install CUDA-compatible PyTorch, Transformers, PEFT, bitsandbytes") from exc
 
     if not torch.cuda.is_available():
-        raise RuntimeError("QLoRA requires a CUDA GPU; no CPU fallback is attempted")
+        raise RuntimeError("QLoRA requires a CUDA GPU")
 
     random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
-    use_bf16 = torch.cuda.is_bf16_supported()
-    compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    quantization = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=compute_dtype,
-    )
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     tokenizer = AutoTokenizer.from_pretrained(
         config.model_id,
@@ -154,53 +180,79 @@ def train_qlora(
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
         revision=config.model_revision,
-        quantization_config=quantization,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=dtype,
+        ),
+        # Single-device map avoids Trainer/DataParallel replication on Kaggle.
         device_map={"": torch.cuda.current_device()},
     )
     resolved_revision = getattr(model.config, "_commit_hash", None) or config.model_revision
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-    model = get_peft_model(model, LoraConfig(
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules="all-linear",
-    ))
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules="all-linear",
+        ),
+    )
 
-    dataset = _TokenizedRows([
-        _encode_row(tokenizer, example, config.max_sequence_length)
-        for example in train_examples
-    ])
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    args = TrainingArguments(
-        output_dir=str(output / "trainer"),
-        num_train_epochs=config.epochs,
-        learning_rate=config.learning_rate,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        logging_steps=1,
-        save_strategy="no",
-        report_to=[],
-        seed=config.seed,
-        data_seed=config.seed,
-        fp16=not use_bf16,
-        bf16=use_bf16,
-        gradient_checkpointing=True,
-        remove_unused_columns=False,
-        optim="paged_adamw_8bit",
+    max_length = min(config.max_sequence_length, 768)
+    encoded = [_encode(tokenizer, row, max_length) for row in train_examples]
+    dataset = _Rows(encoded)
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=lambda batch: _collate(batch, tokenizer.pad_token_id),
     )
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=dataset,
-        data_collator=lambda batch: _collate(batch, tokenizer.pad_token_id),
-    )
-    train_result = trainer.train()
-    trainer.save_model(str(output))
-    tokenizer.save_pretrained(str(output))
+
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable:
+        raise RuntimeError("LoRA model has no trainable parameters")
+    optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate)
+    accumulation = config.gradient_accumulation_steps
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    losses: list[float] = []
+    optimizer_steps = 0
+    started = time.perf_counter()
+
+    for epoch in range(int(config.epochs + 0.999)):
+        for step, batch in enumerate(loader, start=1):
+            device = model.get_input_embeddings().weight.device
+            batch = {key: value.to(device) for key, value in batch.items()}
+            with torch.autocast("cuda", dtype=dtype):
+                loss = model(**batch).loss
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite training loss at epoch {epoch + 1}, step {step}")
+            losses.append(float(loss.detach().cpu()))
+            (loss / accumulation).backward()
+
+            if step % accumulation == 0 or step == len(loader):
+                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+                if optimizer_steps % 10 == 0:
+                    print(
+                        f"epoch={epoch + 1} optimizer_step={optimizer_steps} "
+                        f"loss={losses[-1]:.4f}"
+                    )
+
+    training_seconds = time.perf_counter() - started
+    peak_gpu_bytes = torch.cuda.max_memory_allocated()
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(destination)
+    tokenizer.save_pretrained(destination)
 
     manifest = {
         "status": "completed",
@@ -208,26 +260,31 @@ def train_qlora(
         "base_model_id": config.model_id,
         "base_model_revision": resolved_revision,
         "quantization": "4-bit NF4 with double quantization",
-        "training_example_ids": [item.example_id for item in train_examples],
-        "training_data_sha256": _subset_fingerprint(train_examples),
+        "target": "five HelpSteer2 human ratings",
+        "training_example_ids": [row.example_id for row in train_examples],
+        "training_data_sha256": _fingerprint(train_examples),
         "validation_used_for_gradient_updates": False,
         "test_accessed": False,
         "seed": config.seed,
+        "epochs": config.epochs,
+        "optimizer_steps": optimizer_steps,
+        "mean_training_loss": sum(losses) / len(losses),
+        "training_seconds": training_seconds,
+        "peak_gpu_memory_bytes": peak_gpu_bytes,
         "lora": {
             "rank": config.lora_rank,
             "alpha": config.lora_alpha,
             "dropout": config.lora_dropout,
             "target_modules": "all-linear",
         },
-        "training_metrics": train_result.metrics,
         "torch_version": torch.__version__,
         "gpu_names": [
             torch.cuda.get_device_name(index)
             for index in range(torch.cuda.device_count())
         ],
     }
-    (output / "adapter_manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n",
+    (destination / "adapter_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    return output
+    return destination
